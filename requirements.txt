@@ -1,0 +1,144 @@
+import streamlit as st
+import pandas as pd
+import networkx as nx
+import io
+
+# 1. 核心邏輯：計算移動順序
+def generate_optimized_move_plan(df_ref, df_new):
+    # 提取關鍵資訊
+    def get_slot_map(df):
+        # 建立 Machine-Slot 唯一鍵值
+        df['SlotID'] = df['機台號'].astype(str) + "-" + df['料站'].astype(str)
+        return dict(zip(df['SlotID'], df['子件料號'])), df[['SlotID', '子件料號', '機台號', '料站']]
+
+    ref_map, ref_info = get_slot_map(df_ref.copy())
+    new_map, new_info = get_slot_map(df_new.copy())
+
+    # 找出所有料號的變動
+    moves_needed = []
+    
+    # 以「子件料號」為基準找位置變化
+    # 注意：這裡處理一對一匹配，若同一料號有多站，則依料站順序匹配
+    ref_parts = ref_info.values.tolist() # [SlotID, Part, Machine, Slot]
+    new_parts = new_info.values.tolist()
+
+    # 建立目標位置地圖
+    target_positions = {} # Part -> [TargetSlotIDs]
+    for s, p, m, sl in new_parts:
+        target_positions.setdefault(p, []).append(s)
+
+    # 比對哪些需要移動
+    pending_moves = []
+    current_slots = ref_map.copy()
+
+    for s_old, p_old, m_old, sl_old in ref_parts:
+        if p_old in target_positions and s_old in target_positions[p_old]:
+            # 位置沒變，從目標清單移除，不需移動
+            target_positions[p_old].remove(s_old)
+        else:
+            # 需要移走或移除
+            pending_moves.append({'Part': p_old, 'From': s_old, 'Machine': m_old, 'Slot': sl_old})
+
+    # 最終移動指令集
+    final_plan = []
+    
+    # 步驟 A: 處理移除 (目標表裡沒有的料號，先清空站位)
+    for m in list(pending_moves):
+        p = m['Part']
+        if p not in target_positions or not target_positions[p]:
+            final_plan.append({
+                '機台': m['Machine'], '子件料號': p, '原始站位': m['Slot'], 
+                '目標站位': '下料/移除', '動作': '移除'
+            })
+            if m['From'] in current_slots: del current_slots[m['From']]
+            pending_moves.remove(m)
+
+    # 步驟 B: 處理移動 (目標表裡有的料號，需考慮站位衝突)
+    # 邏輯：只有當「目標站位」目前是空的時候，才能移入
+    moves_to_process = []
+    for m in pending_moves:
+        if m['Part'] in target_positions and target_positions[m['Part']]:
+            dest_slot = target_positions[m['Part']].pop(0)
+            moves_to_process.append({'Part': m['Part'], 'From': m['From'], 'To': dest_slot, 'Machine': m['Machine'], 'Slot': m['Slot']})
+
+    changed = True
+    while moves_to_process and changed:
+        changed = False
+        for m in list(moves_to_process):
+            if m['To'] not in current_slots: # 目標站位是空的
+                final_plan.append({
+                    '機台': m['Machine'], '子件料號': m['Part'], '原始站位': m['Slot'], 
+                    '目標站位': m['To'].split('-')[1], '動作': '移動'
+                })
+                if m['From'] in current_slots: del current_slots[m['From']]
+                current_slots[m['To']] = m['Part']
+                moves_to_process.remove(m)
+                changed = True
+        
+        # 處理環形衝突 (A->B, B->A)：若卡死，強迫將一個料架移往 TEMP
+        if not changed and moves_to_process:
+            m = moves_to_process[0]
+            final_plan.append({
+                '機台': m['Machine'], '子件料號': m['Part'], '原始站位': m['Slot'], 
+                '目標站位': 'TEMP暫存區', '動作': '暫存'
+            })
+            if m['From'] in current_slots: del current_slots[m['From']]
+            m['From'] = 'TEMP' # 更新來源地為暫存區
+            changed = True
+
+    # 步驟 C: 處理新增 (新表有，舊表沒有的)
+    for p, slots in target_positions.items():
+        for s in slots:
+            final_plan.append({
+                '機台': s.split('-')[0], '子件料號': p, '原始站位': '新料架', 
+                '目標站位': s.split('-')[1], '動作': '新增'
+            })
+
+    return pd.DataFrame(final_plan)
+
+# --- Streamlit UI 介面 ---
+st.set_page_config(page_title="Yamaha SMT 換線優化工具", layout="wide")
+st.title("🛠️ Yamaha SMT 站位變更順序表生成器")
+st.markdown("針對 Yamaha P-Tool 導出的 Excel 進行比對，自動規劃最省時且不衝突的移動順序。")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("1. 設定參考站位 (原始狀態)")
+    ref_file = st.file_uploader("上傳參考站 Excel", type=['xlsx', 'csv'], key="ref")
+
+with col2:
+    st.subheader("2. 設定目標站位 (新狀態)")
+    new_files = st.file_uploader("上傳一或多個目標料表", type=['xlsx', 'csv'], accept_multiple_files=True, key="new")
+
+if ref_file and new_files:
+    # 讀取參考檔
+    df_ref = pd.read_excel(ref_file) if ref_file.name.endswith('xlsx') else pd.read_csv(ref_file)
+    
+    for uploaded_file in new_files:
+        st.divider()
+        st.write(f"### 📋 分析檔案：{uploaded_file.name}")
+        
+        df_new = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('xlsx') else pd.read_csv(uploaded_file)
+        
+        try:
+            # 執行運算
+            result_df = generate_optimized_move_plan(df_ref, df_new)
+            result_df.insert(0, '順序', range(1, len(result_df) + 1))
+            
+            # 顯示結果
+            st.dataframe(result_df, use_container_width=True)
+            
+            # 提供下載
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                result_df.to_excel(writer, index=False, sheet_name='移動順序表')
+            
+            st.download_button(
+                label=f"📥 下載 {uploaded_file.name} 移動順序表",
+                data=output.getvalue(),
+                file_name=f"Move_Plan_{uploaded_file.name}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        except Exception as e:
+            st.error(f"分析失敗，請檢查欄位格式是否正確 (需包含: 機台號, 料站, 子件料號)。錯誤原因: {e}")
